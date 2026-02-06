@@ -3,8 +3,10 @@ import { prisma } from '@/lib/prisma';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 import { UserRole, StoreStatus, ServiceProviderStatus } from '@prisma/client';
-import formidable, { Fields, Files } from 'formidable';
+
 import fs from 'fs';
+import cloudinary from '@/lib/cloudinary';
+import path from 'path';
 
 const StoreRegisterSchema = z.object({
   type: z.literal('store'),
@@ -39,15 +41,11 @@ const ServiceProviderRegisterSchema = z.object({
 
 export async function POST(request: NextRequest) {
   try {
-    // Ensure upload directory exists
-    const uploadDir = './public/uploads';
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true });
-    }
+    // Upload directory creation removed for Cloudinary migration
 
     // Convert NextRequest to Node.js request for formidable
     const formData = await request.formData();
-    
+
     // Helper to get string value from FormData
     const getField = (field: FormDataEntryValue | null) => {
       if (field === null) return '';
@@ -55,7 +53,7 @@ export async function POST(request: NextRequest) {
     };
 
     const type = getField(formData.get('type'));
-    
+
     if (!type) {
       return NextResponse.json({ error: 'Missing registration type' }, { status: 400 });
     }
@@ -135,13 +133,27 @@ export async function POST(request: NextRequest) {
           // Handle file uploads if any
           const documents = formData.getAll('documents');
           if (documents.length > 0) {
-            const documentData = documents
+            const uploadPromises = documents
               .filter((doc): doc is File => doc instanceof File)
-              .map((file) => ({
-                url: `/uploads/${file.name}`,
-                type: file.type,
-                userId: user.id
-              }));
+              .map(async (file) => {
+                const buffer = Buffer.from(await file.arrayBuffer());
+                const tempPath = path.join('/tmp', `${Date.now()}-${file.name}`);
+                await fs.promises.writeFile(tempPath, buffer as any);
+                try {
+                  const result = await cloudinary.uploader.upload(tempPath, {
+                    folder: 'store_documents',
+                  });
+                  return {
+                    url: result.secure_url,
+                    type: file.type,
+                    userId: user.id
+                  };
+                } finally {
+                  await fs.promises.unlink(tempPath).catch(() => { });
+                }
+              });
+
+            const documentData = await Promise.all(uploadPromises);
 
             if (documentData.length > 0) {
               await tx.document.createMany({
@@ -238,13 +250,27 @@ export async function POST(request: NextRequest) {
           // Handle file uploads if any
           const documents = formData.getAll('documents');
           if (documents.length > 0) {
-            const documentData = documents
+            const uploadPromises = documents
               .filter((doc): doc is File => doc instanceof File)
-              .map((file) => ({
-                url: `/uploads/${file.name}`,
-                type: file.type,
-                userId: user.id
-              }));
+              .map(async (file) => {
+                const buffer = Buffer.from(await file.arrayBuffer());
+                const tempPath = path.join('/tmp', `${Date.now()}-${file.name}`);
+                await fs.promises.writeFile(tempPath, buffer as any);
+                try {
+                  const result = await cloudinary.uploader.upload(tempPath, {
+                    folder: 'provider_documents',
+                  });
+                  return {
+                    url: result.secure_url,
+                    type: file.type,
+                    userId: user.id
+                  };
+                } finally {
+                  await fs.promises.unlink(tempPath).catch(() => { });
+                }
+              });
+
+            const documentData = await Promise.all(uploadPromises);
 
             if (documentData.length > 0) {
               await tx.document.createMany({
@@ -344,7 +370,7 @@ export async function PATCH(request: NextRequest) {
       // Update user registration status
       await prisma.user.update({
         where: { id: userId },
-        data: { 
+        data: {
           registration_status: 'APPROVED',
           is_active: true
         }
@@ -354,37 +380,37 @@ export async function PATCH(request: NextRequest) {
       if (user.role === 'STORE_REGISTER' && user.store) {
         await prisma.store.update({
           where: { id: user.store.id },
-          data: { 
+          data: {
             status: 'APPROVED',
             approved_at: new Date()
           }
         });
       } else if (user.role === 'SERVICE_PROVIDER' && user.service_provider) {
         // For service providers, check if approved by moderator
-        const updateData: any = { 
+        const updateData: any = {
           status: 'APPROVED',
           approved_at: new Date()
         };
-        
+
         if (moderator_id) {
           // Verify the moderator exists and is assigned to a store
           const moderator = await prisma.user.findUnique({
             where: { id: moderator_id },
             include: { moderated_stores: true }
           });
-          
+
           if (moderator && moderator.role === 'MODERATOR' && moderator.moderated_stores.length > 0) {
             updateData.approved_by_moderator_id = moderator_id;
           }
         }
-        
+
         await prisma.serviceProvider.update({
           where: { id: user.service_provider.id },
           data: updateData
         });
       }
 
-      return NextResponse.json({ 
+      return NextResponse.json({
         message: 'User approved successfully',
         user: {
           id: user.id,
@@ -397,7 +423,7 @@ export async function PATCH(request: NextRequest) {
       // Update user registration status
       await prisma.user.update({
         where: { id: userId },
-        data: { 
+        data: {
           registration_status: 'REJECTED',
           is_active: false
         }
@@ -416,7 +442,7 @@ export async function PATCH(request: NextRequest) {
         });
       }
 
-      return NextResponse.json({ 
+      return NextResponse.json({
         message: 'User rejected successfully',
         user: {
           id: user.id,
@@ -429,12 +455,12 @@ export async function PATCH(request: NextRequest) {
       // Activate user account
       await prisma.user.update({
         where: { id: userId },
-        data: { 
+        data: {
           is_active: true
         }
       });
 
-      return NextResponse.json({ 
+      return NextResponse.json({
         message: 'User activated successfully',
         user: {
           id: user.id,
@@ -447,12 +473,12 @@ export async function PATCH(request: NextRequest) {
       // Deactivate user account
       await prisma.user.update({
         where: { id: userId },
-        data: { 
+        data: {
           is_active: false
         }
       });
 
-      return NextResponse.json({ 
+      return NextResponse.json({
         message: 'User deactivated successfully',
         user: {
           id: user.id,
