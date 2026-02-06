@@ -6,6 +6,8 @@ import { prisma } from '@/lib/prisma';
 // Import TicketPriority and TicketStatus from Prisma client
 import { TicketPriority, TicketStatus } from '@prisma/client';
 
+//the core purpose of this orcastrator is to take a new problem (a "ticket"), understand it, and efficiently assign it to the best available service provider who can fix it. It also manages the entire lifecycle of the ticket after the initial assignment.
+
 export class AIOrchestrator {
   async processNewTicket(ticketData: {
     description: string;

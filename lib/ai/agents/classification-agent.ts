@@ -17,6 +17,7 @@ export class ClassificationAgent {
   private genModel: any = null;
   private useMock: boolean = false;
 
+  //every time this agent get called this will run and init the googlegenerativeAi 
   constructor() {
     const apiKey = process.env.GEMINI_API_KEY;
     if (apiKey && apiKey.trim() !== '') {
@@ -34,6 +35,7 @@ export class ClassificationAgent {
     }
   }
 
+  //mock data in case agents does not working
   private mockClassify(description: string): Classification {
     const lowerDesc = description.toLowerCase();
     
