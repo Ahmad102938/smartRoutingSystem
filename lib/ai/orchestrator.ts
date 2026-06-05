@@ -2,6 +2,8 @@ import { classificationAgent } from './agents/classification-agent';
 import { availabilityAgent } from './agents/availability-agent';
 import { routingAgent } from './agents/routing-agent';
 import { escalationAgent } from './agents/escalation-agent';
+import { similarityAgent } from './agents/similarity-agent';
+import { explainerAgent } from './agents/explainer-agent';
 import { prisma } from '@/lib/prisma';
 // Import TicketPriority and TicketStatus from Prisma client
 import { TicketPriority, TicketStatus } from '@prisma/client';
@@ -28,6 +30,21 @@ export class AIOrchestrator {
         createdAt
       );
 
+      // Step 2.5: Upsert Asset if a QR was scanned.
+      // We accumulate equipment identity from day 1 so future similarity/history features have data.
+      let assetId: string | null = null;
+      if (ticketData.qr_asset_id && ticketData.qr_asset_id.trim() !== '') {
+        const asset = await prisma.asset.upsert({
+          where: { qr_code: ticketData.qr_asset_id },
+          update: {},
+          create: {
+            qr_code: ticketData.qr_asset_id,
+            store_id: ticketData.store_id
+          }
+        });
+        assetId = asset.id;
+      }
+
       // Step 3: Create ticket in database
       console.log('Creating ticket...');
       const ticket = await prisma.ticket.create({
@@ -36,6 +53,7 @@ export class AIOrchestrator {
           reporter_user_id: ticketData.reporter_user_id,
           description: ticketData.description,
           qr_asset_id: ticketData.qr_asset_id,
+          asset_id: assetId,
           ai_classification_category: classification.category,
           ai_classification_subcategory: classification.subcategory,
           ai_priority: classification.priority as TicketPriority,
@@ -88,6 +106,20 @@ export class AIOrchestrator {
         console.log(`✅ Found ${providersWithGoodSkills.length} providers with good skill matches`);
       }
 
+      // Step 5.5: Embed ticket text and enrich candidates with semantic + asset history features.
+      // The embedding is also persisted on the ticket row for future training.
+      const ticketText = `${ticketData.description}\n${classification.category} / ${classification.subcategory}`;
+      // Fire-and-forget the ticket embedding write — don't block routing on it.
+      similarityAgent.embedTicket(ticket.id, ticketText).catch(err =>
+        console.warn('Ticket embed failed (non-blocking):', err)
+      );
+
+      const enrichedProviders = await this.enrichWithSimilarityFeatures(
+        availableProviders,
+        ticketText,
+        assetId
+      );
+
       // Step 6: Route to best provider
       console.log('Routing to best provider...');
       const routing = await routingAgent.routeTicket(
@@ -96,8 +128,17 @@ export class AIOrchestrator {
         classification.subcategory,
         classification.priority as TicketPriority,
         storeLocation,
-        availableProviders
+        enrichedProviders
       );
+
+      // Step 7: Kick off async LLM explainer. Fire-and-forget — the user gets their
+      // assignment confirmation immediately while Gemini drafts the audit-trail rationale
+      // in the background. Failures are logged on the assignment row, not surfaced here.
+      setImmediate(() => {
+        explainerAgent.processPending(1).catch(err =>
+          console.warn('Async explainer kick-off failed:', err)
+        );
+      });
 
       return {
         ticket,
@@ -111,6 +152,61 @@ export class AIOrchestrator {
     } catch (error) {
       console.error('Error processing ticket:', error);
       throw error;
+    }
+  }
+
+  /**
+   * Decorate availability-agent candidates with two new features:
+   *   - semantic_similarity: 0..1 cosine similarity between ticket text and the candidate's
+   *     skill_embedding (synthesized from past resolved tickets). Defaults to 0 when no
+   *     skill profile has been built yet.
+   *   - asset_history_good_ratio: 0..1 fraction of past tickets on this asset (or model)
+   *     resolved successfully by this candidate. Defaults to 0 when no history.
+   *
+   * Both features degrade gracefully — early on, every provider scores 0 and the routing
+   * decision falls back to the deterministic features (skill string match, distance, load,
+   * historical completion). As outcomes accumulate, the new features carry more signal.
+   */
+  private async enrichWithSimilarityFeatures(
+    providers: any[],
+    ticketText: string,
+    assetId: string | null
+  ): Promise<any[]> {
+    try {
+      const providerIds = providers.map(p => p.id);
+
+      // Get top-K technician fits by semantic similarity, then map back onto provider IDs
+      // via the user's associated_provider_id.
+      const techFits = await similarityAgent.rankTechniciansByFit(ticketText, 100);
+      const bestSimByProvider = new Map<string, number>();
+      for (const tf of techFits) {
+        if (!tf.service_provider_id) continue;
+        const prior = bestSimByProvider.get(tf.service_provider_id) ?? 0;
+        if (tf.similarity > prior) {
+          bestSimByProvider.set(tf.service_provider_id, tf.similarity);
+        }
+      }
+
+      const assetHistory = await similarityAgent.assetHistoryByCandidate(
+        assetId,
+        providerIds,
+        []
+      );
+
+      return providers.map(p => ({
+        ...p,
+        semantic_similarity: bestSimByProvider.get(p.id) ?? 0,
+        asset_history_good_ratio: assetHistory.get(p.id)?.good_ratio ?? 0,
+        asset_history_total: assetHistory.get(p.id)?.total_outcomes ?? 0
+      }));
+    } catch (err) {
+      console.warn('Similarity feature enrichment failed (continuing with base features):', err);
+      return providers.map(p => ({
+        ...p,
+        semantic_similarity: 0,
+        asset_history_good_ratio: 0,
+        asset_history_total: 0
+      }));
     }
   }
 
@@ -202,15 +298,8 @@ export class AIOrchestrator {
         }
       });
 
-      // Decrement provider load
-      await prisma.serviceProvider.update({
-        where: { id: providerId },
-        data: {
-          current_load: {
-            decrement: 1
-          }
-        }
-      });
+      // Load is now derived from TicketAssignment counts in availability-agent;
+      // the REJECTED status above already removes this assignment from the live count.
 
       // Get ticket details for re-routing
       const ticket = await prisma.ticket.findUnique({
@@ -299,15 +388,9 @@ export class AIOrchestrator {
         }
       });
 
-      // Decrement provider load
-      await prisma.serviceProvider.update({
-        where: { id: providerId },
-        data: {
-          current_load: {
-            decrement: 1
-          }
-        }
-      });
+      // Load is derived from TicketAssignment counts; no manual decrement needed.
+      // The assignment status will transition out of PROPOSED/ACCEPTED when the moderator
+      // verifies and closes the ticket via the verify endpoint.
 
       console.log(`Ticket ${ticketId} marked as completed by provider ${providerId}`);
     } catch (error) {

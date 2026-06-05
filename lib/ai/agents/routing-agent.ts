@@ -1,4 +1,3 @@
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import { prisma } from '@/lib/prisma';
 import { TicketPriority } from '@prisma/client';
 
@@ -10,32 +9,13 @@ interface ProviderScore {
     availability: number;
     proximity: number;
     performance: number;
+    semanticSimilarity: number;
+    assetHistory: number;
   };
   reasoning: string;
 }
 
 export class RoutingAgent {
-  private model: GoogleGenerativeAI | null = null;
-  private genModel: any = null;
-  private useMock: boolean = false;
-
-  constructor() {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (apiKey && apiKey.trim() !== '') {
-      try {
-        this.model = new GoogleGenerativeAI(apiKey);
-        this.genModel = this.model.getGenerativeModel({ model: 'gemini-1.5-flash' });
-        this.useMock = false;
-      } catch (error) {
-        console.warn('Failed to initialize Gemini AI for routing, using standard routing:', error);
-        this.useMock = true;
-      }
-    } else {
-      console.warn('No Gemini API key provided for routing, using standard routing');
-      this.useMock = true;
-    }
-  }
-
   private calculateSkillMatch(providerSkills: string[], category: string, subcategory: string): number {
     const requiredSkills = this.getCategorySkills(category, subcategory);
     let totalScore = 0;
@@ -133,44 +113,59 @@ export class RoutingAgent {
   private async calculateProviderScore(provider: any, category: string, subcategory: string, priority: TicketPriority): Promise<ProviderScore> {
     // Skill matching score (0-1)
     const skillMatch = this.calculateSkillMatch(provider.skills, category, subcategory);
-    
+
     // Availability score (0-1)
     const availability = 1 - (provider.current_load / provider.capacity_per_day);
-    
+
     // Proximity score (0-1) - closer is better
     const proximity = this.calculateProximityScore(provider.distance || 0);
-    
+
     // Performance score (0-1) - based on historical data
     const performance = await this.calculatePerformanceScore(provider.id);
 
-    // Weighted scoring
+    // Semantic similarity (0-1) — set by orchestrator.enrichWithSimilarityFeatures.
+    // Defaults to 0 until a technician's skill_embedding is built from past good outcomes.
+    const semanticSimilarity = Math.max(0, Math.min(1, provider.semantic_similarity ?? 0));
+
+    // Asset history good ratio (0-1) — fraction of past tickets on this asset/model that
+    // this provider resolved with a GOOD verdict. 0 when no history exists.
+    const assetHistory = Math.max(0, Math.min(1, provider.asset_history_good_ratio ?? 0));
+
+    // Base weights. Total = 1.0.
     const weights = {
-      skillMatch: 0.4,
-      availability: 0.2,
-      proximity: 0.3,
-      performance: 0.1
+      skillMatch: 0.30,
+      availability: 0.15,
+      proximity: 0.20,
+      performance: 0.10,
+      semanticSimilarity: 0.15,
+      assetHistory: 0.10
     };
 
-    // Priority adjustments
+    // Priority adjustments — HIGH urgency favors fast-arrival features over learned signals.
     if (priority === 'HIGH') {
-      weights.proximity += 0.1;
-      weights.availability += 0.1;
-      weights.skillMatch -= 0.1;
-      weights.performance -= 0.1;
+      weights.proximity += 0.10;
+      weights.availability += 0.10;
+      weights.skillMatch -= 0.05;
+      weights.semanticSimilarity -= 0.10;
+      weights.assetHistory -= 0.05;
     }
 
-    const totalScore = 
+    const totalScore =
       skillMatch * weights.skillMatch +
       availability * weights.availability +
       proximity * weights.proximity +
-      performance * weights.performance;
+      performance * weights.performance +
+      semanticSimilarity * weights.semanticSimilarity +
+      assetHistory * weights.assetHistory;
 
     const reasoning = `
 Provider ${provider.company_name} scored ${(totalScore * 100).toFixed(1)}%:
 - Skill Match: ${(skillMatch * 100).toFixed(1)}% (weight: ${weights.skillMatch})
 - Availability: ${(availability * 100).toFixed(1)}% (${provider.current_load}/${provider.capacity_per_day} capacity)
 - Proximity: ${(proximity * 100).toFixed(1)}% (${provider.distance?.toFixed(1)}km away)
-- Performance: ${(performance * 100).toFixed(1)}% (historical average)
+- Performance: ${(performance * 100).toFixed(1)}% (historical avg)
+- Semantic Similarity: ${(semanticSimilarity * 100).toFixed(1)}% (vs past resolved tickets)
+- Asset History: ${(assetHistory * 100).toFixed(1)}% good outcomes on this asset/model (n=${provider.asset_history_total ?? 0})
 Priority: ${priority}
     `.trim();
 
@@ -181,7 +176,9 @@ Priority: ${priority}
         skillMatch,
         availability,
         proximity,
-        performance
+        performance,
+        semanticSimilarity,
+        assetHistory
       },
       reasoning
     };
@@ -194,7 +191,7 @@ Priority: ${priority}
     priority: TicketPriority,
     storeLocation: { latitude: number; longitude: number },
     availableProviders: any[]
-  ): Promise<{ providerId: string; score: number; reasoning: string }> {
+  ): Promise<{ providerId: string; score: number; reasoning: string; wasExploration: boolean }> {
     try {
       if (!availableProviders.length) {
         throw new Error('No available providers found');
@@ -207,22 +204,58 @@ Priority: ${priority}
         providerScores.push(score);
       }
 
-      // Sort by score (highest first)
       providerScores.sort((a, b) => b.score - a.score);
 
-      const bestProvider = providerScores[0];
+      // Epsilon-greedy exploration: with probability EXPLORATION_RATE, pick uniformly
+      // from the top 3 instead of strictly the top 1. Without this, the eventual learned
+      // ranker only ever sees data from its own policy (selection-bias poisoning).
+      const explorationRate = parseFloat(process.env.ROUTING_EXPLORATION_RATE ?? '0.1');
+      const shouldExplore = providerScores.length >= 2 && Math.random() < explorationRate;
+      let bestProvider: ProviderScore;
+      if (shouldExplore) {
+        const topK = providerScores.slice(0, Math.min(3, providerScores.length));
+        bestProvider = topK[Math.floor(Math.random() * topK.length)];
+      } else {
+        bestProvider = providerScores[0];
+      }
 
-      // Create ticket assignment
+      // Counterfactual log: store top-5 candidates with their scores BEFORE the policy choice,
+      // so a future learned ranker can train on what would have happened with each pick.
+      const topCandidates = providerScores.slice(0, 5).map(p => ({
+        provider_id: p.providerId,
+        score: p.score,
+        breakdown: p.breakdown
+      }));
+
+      await prisma.routingDecisionLog.create({
+        data: {
+          ticket_id: ticketId,
+          picked_provider_id: bestProvider.providerId,
+          was_exploration: shouldExplore,
+          candidates: topCandidates,
+          feature_vector: {
+            category,
+            subcategory,
+            priority,
+            store_location: storeLocation,
+            candidate_count: providerScores.length
+          }
+        }
+      });
+
       await prisma.ticketAssignment.create({
         data: {
           ticket_id: ticketId,
           service_provider_id: bestProvider.providerId,
           assignment_sequence: 1,
-          status: 'PROPOSED'
+          status: 'PROPOSED',
+          was_exploration: shouldExplore
         }
       });
 
-      // Update ticket status
+      // Ticket.assigned_service_provider_id is kept as a denormalized cache for legacy reads
+      // (9 call sites). Source of truth is the active TicketAssignment row; this field will
+      // be removed in a follow-up sweep.
       await prisma.ticket.update({
         where: { id: ticketId },
         data: {
@@ -232,20 +265,11 @@ Priority: ${priority}
         }
       });
 
-      // Update provider load
-      await prisma.serviceProvider.update({
-        where: { id: bestProvider.providerId },
-        data: {
-          current_load: {
-            increment: 1
-          }
-        }
-      });
-
       return {
         providerId: bestProvider.providerId,
         score: bestProvider.score,
-        reasoning: bestProvider.reasoning
+        reasoning: bestProvider.reasoning,
+        wasExploration: shouldExplore
       };
 
     } catch (error) {

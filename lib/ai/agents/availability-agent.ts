@@ -55,13 +55,32 @@ export class AvailabilityAgent {
 
       console.log(`Found ${allProviders.length} approved providers`);
 
-      // Step 3: Filter by capacity
-      console.log('Step 3: Filtering providers by capacity...');
-      const capacityFiltered = allProviders.filter(provider => 
-        provider.current_load < provider.capacity_per_day
+      // Step 3: Derive live load from TicketAssignment counts (not the stale current_load column).
+      // Single GROUP BY avoids N+1; falls back to 0 for providers with no active assignments.
+      console.log('Step 3: Deriving live load and filtering by capacity...');
+      const providerIds = allProviders.map(p => p.id);
+      const liveLoadRows = providerIds.length > 0
+        ? await prisma.ticketAssignment.groupBy({
+            by: ['service_provider_id'],
+            where: {
+              service_provider_id: { in: providerIds },
+              status: { in: ['PROPOSED', 'ACCEPTED'] }
+            },
+            _count: { _all: true }
+          })
+        : [];
+      const liveLoadByProvider = new Map<string, number>(
+        liveLoadRows.map(r => [r.service_provider_id, r._count._all])
       );
 
-      console.log(`${capacityFiltered.length} providers have available capacity`);
+      const capacityFiltered = allProviders
+        .map(provider => {
+          const liveLoad = liveLoadByProvider.get(provider.id) ?? 0;
+          return { ...provider, current_load: liveLoad };
+        })
+        .filter(provider => provider.current_load < provider.capacity_per_day);
+
+      console.log(`${capacityFiltered.length} providers have available capacity (live load)`);
 
       // Step 4: Calculate skill scores for all providers (don't filter out)
       console.log('Step 4: Calculating skill scores for all providers...');

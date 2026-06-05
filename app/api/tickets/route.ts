@@ -5,7 +5,7 @@ import { requirePermission } from '@/lib/auth/rbac';
 import { aiOrchestrator } from '@/lib/ai/orchestrator';
 import { prisma } from '@/lib/prisma';
 import { z } from 'zod';
-import { TicketPriority, TicketStatus } from '@prisma/client';
+import { Prisma, TicketPriority, TicketStatus } from '@prisma/client';
 
 const CreateTicketSchema = z.object({
   description: z.string().min(10).max(1000),
@@ -13,12 +13,7 @@ const CreateTicketSchema = z.object({
   qr_asset_id: z.string().optional()
 });
 
-type TicketWhere = {
-  store_id?: string | { in: string[] };
-  assigned_service_provider_id?: string;
-  status?: TicketStatus;
-  ai_priority?: TicketPriority;
-};
+type TicketWhere = Prisma.TicketWhereInput;
 
 export async function POST(request: NextRequest) {
   try {
@@ -93,7 +88,15 @@ export async function GET(request: NextRequest) {
     if (session.user.role === 'STORE_REGISTER') {
       whereClause.store_id = session.user.associated_store_id;
     } else if (session.user.role === 'SERVICE_PROVIDER') {
-      whereClause.assigned_service_provider_id = session.user.associated_provider_id;
+      // Show tickets where the user's company is assigned OR the user themselves is the
+      // named technician on an active assignment. Source of truth is TicketAssignment;
+      // the denormalized Ticket.assigned_service_provider_id is no longer the filter.
+      // (TECHNICIAN role users will be handled here once the next-auth types are extended.)
+      const providerId = session.user.associated_provider_id;
+      const orFilters: Prisma.TicketAssignmentWhereInput[] = [];
+      if (providerId) orFilters.push({ service_provider_id: providerId });
+      orFilters.push({ assigned_user_id: session.user.id });
+      whereClause.assignments = { some: { OR: orFilters } };
     } else if (session.user.role === 'MODERATOR') {
       // Get tickets for stores moderated by this user
       const moderatedStores = await prisma.store.findMany({

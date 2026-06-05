@@ -30,6 +30,10 @@ model User {
   reported_tickets       Ticket[]               @relation("TicketReporter")
   service_provider       ServiceProvider?       @relation("ServiceProviderUser", fields: [associated_provider_id], references: [id])
   store                  Store?                 @relation("StoreRegister", fields: [associated_store_id], references: [id])
+  technician_skills      TechnicianSkill[]
+  technician_assignments TicketAssignment[]     @relation("AssignedTechnician")
+  verifications          TicketRating[]         @relation("RatingModerator")
+  outcomes_logged        TicketOutcome[]        @relation("OutcomeTechnician")
 
   @@map("users")
 }
@@ -62,6 +66,7 @@ model Store {
   moderator            User?       @relation("StoreModerator", fields: [moderator_user_id], references: [id])
   tickets              Ticket[]
   register_users       User[]      @relation("StoreRegister")
+  assets               Asset[]
 
   @@map("stores")
 }
@@ -94,6 +99,7 @@ model Ticket {
   reporter_user_id              String
   description                   String
   qr_asset_id                   String?
+  asset_id                      String?
   ai_classification_category    String
   ai_classification_subcategory String
   ai_priority                   TicketPriority
@@ -109,29 +115,126 @@ model Ticket {
   escalations                   Escalation[]
   remarks                       Remark[]
   assignments                   TicketAssignment[]
+  asset                         Asset?             @relation(fields: [asset_id], references: [id])
   assigned_provider             ServiceProvider?   @relation("AssignedProvider", fields: [assigned_service_provider_id], references: [id])
   reporter                      User               @relation("TicketReporter", fields: [reporter_user_id], references: [id])
   store                         Store              @relation(fields: [store_id], references: [id])
+  outcome                       TicketOutcome?
+  rating                        TicketRating?
+  routing_decisions             RoutingDecisionLog[]
 
+  @@index([asset_id])
   @@map("tickets")
 }
 
 model TicketAssignment {
-  id                    String                 @id @default(cuid())
-  ticket_id             String
-  service_provider_id   String
-  assignment_sequence   Int
-  assigned_at           DateTime               @default(now())
-  status                TicketAssignmentStatus @default(PROPOSED)
-  accepted_at           DateTime?
-  rejected_at           DateTime?
-  rejection_reason      String?
-  accepted_emp_id       String?
-  accepted_phone_number String?
-  service_provider      ServiceProvider        @relation(fields: [service_provider_id], references: [id])
-  ticket                Ticket                 @relation(fields: [ticket_id], references: [id])
+  id                          String                 @id @default(cuid())
+  ticket_id                   String
+  service_provider_id         String
+  assigned_user_id            String?
+  assignment_sequence         Int
+  assigned_at                 DateTime               @default(now())
+  status                      TicketAssignmentStatus @default(PROPOSED)
+  accepted_at                 DateTime?
+  rejected_at                 DateTime?
+  rejection_reason            String?
+  accepted_emp_id             String?
+  accepted_phone_number       String?
+  was_exploration             Boolean                @default(false)
+  explanation                 String?
+  explanation_status          ExplanationStatus      @default(PENDING)
+  ai_disagreement             Boolean                @default(false)
+  explained_at                DateTime?
+  service_provider            ServiceProvider        @relation(fields: [service_provider_id], references: [id])
+  ticket                      Ticket                 @relation(fields: [ticket_id], references: [id])
+  assigned_technician         User?                  @relation("AssignedTechnician", fields: [assigned_user_id], references: [id])
 
+  @@index([assigned_user_id, status])
+  @@index([service_provider_id, status])
+  @@index([explanation_status])
   @@map("ticket_assignments")
+}
+
+model Asset {
+  id            String   @id @default(cuid())
+  qr_code       String   @unique
+  store_id      String
+  category      String?
+  make          String?
+  model         String?
+  install_date  DateTime?
+  description   String?
+  first_seen_at DateTime @default(now())
+  store         Store    @relation(fields: [store_id], references: [id])
+  tickets       Ticket[]
+
+  @@index([store_id])
+  @@map("assets")
+}
+
+model TechnicianSkill {
+  id               String              @id @default(cuid())
+  user_id          String
+  skill            String
+  proficiency      SkillProficiency    @default(COMPETENT)
+  years_experience Int?
+  last_used_at     DateTime?
+  created_at       DateTime            @default(now())
+  user             User                @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([user_id, skill])
+  @@index([skill])
+  @@map("technician_skills")
+}
+
+model TicketOutcome {
+  id                     String   @id @default(cuid())
+  ticket_id              String   @unique
+  resolved_by_user_id    String
+  resolution_time_minutes Int
+  first_time_fix         Boolean  @default(true)
+  root_cause             String
+  parts_used             Json?
+  technician_notes       String
+  was_reassigned         Boolean  @default(false)
+  reassignment_count     Int      @default(0)
+  resolved_at            DateTime @default(now())
+  ticket                 Ticket   @relation(fields: [ticket_id], references: [id], onDelete: Cascade)
+  resolved_by            User     @relation("OutcomeTechnician", fields: [resolved_by_user_id], references: [id])
+
+  @@index([resolved_by_user_id])
+  @@map("ticket_outcomes")
+}
+
+model TicketRating {
+  id                  String         @id @default(cuid())
+  ticket_id           String         @unique
+  moderator_user_id   String
+  verdict             RatingVerdict
+  tags                String[]
+  comment             String?
+  rated_at            DateTime       @default(now())
+  ticket              Ticket         @relation(fields: [ticket_id], references: [id], onDelete: Cascade)
+  moderator           User           @relation("RatingModerator", fields: [moderator_user_id], references: [id])
+
+  @@index([verdict])
+  @@map("ticket_ratings")
+}
+
+model RoutingDecisionLog {
+  id                String   @id @default(cuid())
+  ticket_id         String
+  picked_provider_id String?
+  picked_user_id    String?
+  was_exploration   Boolean  @default(false)
+  candidates        Json
+  feature_vector    Json?
+  created_at        DateTime @default(now())
+  ticket            Ticket   @relation(fields: [ticket_id], references: [id], onDelete: Cascade)
+
+  @@index([ticket_id])
+  @@index([created_at])
+  @@map("routing_decision_logs")
 }
 
 model Remark {
@@ -169,8 +272,20 @@ enum UserRegistrationStatus {
 enum UserRole {
   STORE_REGISTER
   SERVICE_PROVIDER
+  TECHNICIAN
   ADMIN
   MODERATOR
+}
+
+enum SkillProficiency {
+  NOVICE
+  COMPETENT
+  EXPERT
+}
+
+enum RatingVerdict {
+  GOOD
+  BAD
 }
 
 enum StoreStatus {
@@ -215,4 +330,10 @@ enum EscalationStatus {
   TRIGGERED
   ACKNOWLEDGED
   RESOLVED
+}
+
+enum ExplanationStatus {
+  PENDING
+  COMPLETED
+  FAILED
 }
